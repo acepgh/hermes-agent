@@ -870,7 +870,12 @@ class TeamsAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         logger.info("[teams] Disconnected")
 
-    async def _fetch_attachment_bytes(self, url: str, timeout: float = 30.0) -> bytes:
+    async def _fetch_attachment_bytes(
+        self,
+        url: str,
+        timeout: float = 30.0,
+        retries: int = 2,
+    ) -> bytes:
         """Download attachment bytes with SSRF and token-exfiltration protection.
 
         SharePoint file-download URLs are pre-authenticated and receive no bot
@@ -897,17 +902,40 @@ class TeamsAdapter(BasePlatformAdapter):
                 raise RuntimeError("Teams app returned no Bot Framework attachment token")
             headers["Authorization"] = f"Bearer {token}"
 
+        import httpx
+
         async with create_ssrf_safe_async_client(
             timeout=timeout,
             follow_redirects=True,
             event_hooks={"response": [_ssrf_redirect_guard]},
         ) as client:
-            async with client.stream("GET", url, headers=headers) as response:
-                response.raise_for_status()
-                return await _read_httpx_body_with_limit(
-                    response,
-                    media_type="attachment",
-                )
+            for attempt in range(retries + 1):
+                try:
+                    async with client.stream("GET", url, headers=headers) as response:
+                        response.raise_for_status()
+                        return await _read_httpx_body_with_limit(
+                            response,
+                            media_type="attachment",
+                        )
+                except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                    if (
+                        isinstance(exc, httpx.HTTPStatusError)
+                        and exc.response.status_code < 429
+                    ):
+                        raise
+                    if attempt >= retries:
+                        raise
+                    wait = 1.5 * (attempt + 1)
+                    logger.debug(
+                        "[teams] Attachment download retry %d/%d after %.1fs: %s",
+                        attempt + 1,
+                        retries,
+                        wait,
+                        type(exc).__name__,
+                    )
+                    await asyncio.sleep(wait)
+
+        raise RuntimeError("Teams attachment download exhausted without a result")
 
     async def _on_message(self, ctx: ActivityContext[MessageActivity]) -> None:
         """Process an incoming Teams message and dispatch to the gateway."""

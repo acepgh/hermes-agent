@@ -701,6 +701,73 @@ class TestTeamsAttachmentClassification:
             )
 
     @pytest.mark.anyio
+    async def test_attachment_download_retries_transient_http_status(self, monkeypatch):
+        adapter = self._make_adapter()
+        request = httpx.Request(
+            "GET",
+            "https://contoso.sharepoint.com/download/image.png",
+        )
+        retry_response = httpx.Response(429, request=request)
+        retry_error = httpx.HTTPStatusError(
+            "rate limited",
+            request=request,
+            response=retry_response,
+        )
+        first_response = SimpleNamespace(
+            headers={},
+            raise_for_status=MagicMock(side_effect=retry_error),
+        )
+
+        async def chunks():
+            yield b"image bytes"
+
+        second_response = SimpleNamespace(
+            headers={},
+            aiter_bytes=chunks,
+            raise_for_status=MagicMock(),
+        )
+
+        class ResponseContext:
+            def __init__(self, response):
+                self.response = response
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *_args):
+                return False
+
+        client = SimpleNamespace(
+            stream=MagicMock(
+                side_effect=[
+                    ResponseContext(first_response),
+                    ResponseContext(second_response),
+                ]
+            )
+        )
+
+        class ClientContext:
+            async def __aenter__(self):
+                return client
+
+            async def __aexit__(self, *_args):
+                return False
+
+        sleep = AsyncMock()
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client",
+            lambda **_kwargs: ClientContext(),
+        )
+        monkeypatch.setattr(_teams_mod.asyncio, "sleep", sleep)
+
+        data = await adapter._fetch_attachment_bytes(str(request.url))
+
+        assert data == b"image bytes"
+        assert client.stream.call_count == 2
+        sleep.assert_awaited_once_with(1.5)
+
+    @pytest.mark.anyio
     async def test_protected_image_uses_authenticated_attachment_download(self):
         from gateway.platforms.base import MessageType
 
