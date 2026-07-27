@@ -576,17 +576,98 @@ class TestTeamsAttachmentClassification:
         assert event.media_types == ["application/pdf"]
 
     @pytest.mark.anyio
+    async def test_bot_framework_download_adds_sdk_bearer_token(self, monkeypatch):
+        adapter = self._make_adapter()
+        adapter._app._get_bot_token = AsyncMock(return_value="bot-token")
+        response = SimpleNamespace(
+            content=b"protected image",
+            raise_for_status=MagicMock(),
+        )
+        client = SimpleNamespace(get=AsyncMock(return_value=response))
+
+        class ClientContext:
+            async def __aenter__(self):
+                return client
+
+            async def __aexit__(self, *_args):
+                return False
+
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client",
+            lambda **_kwargs: ClientContext(),
+        )
+
+        data = await adapter._fetch_attachment_bytes(
+            "https://smba.trafficmanager.net/amer/tenant/v3/attachments/1/views/original"
+        )
+
+        assert data == b"protected image"
+        request_headers = client.get.await_args.kwargs["headers"]
+        assert request_headers["Authorization"] == "Bearer bot-token"
+
+    @pytest.mark.anyio
+    async def test_non_bot_framework_download_never_receives_bot_token(self, monkeypatch):
+        adapter = self._make_adapter()
+        adapter._app._get_bot_token = AsyncMock(return_value="bot-token")
+        response = SimpleNamespace(content=b"file", raise_for_status=MagicMock())
+        client = SimpleNamespace(get=AsyncMock(return_value=response))
+
+        class ClientContext:
+            async def __aenter__(self):
+                return client
+
+            async def __aexit__(self, *_args):
+                return False
+
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client",
+            lambda **_kwargs: ClientContext(),
+        )
+
+        await adapter._fetch_attachment_bytes(
+            "https://contoso.sharepoint.com/download/image.png"
+        )
+
+        adapter._app._get_bot_token.assert_not_awaited()
+        request_headers = client.get.await_args.kwargs["headers"]
+        assert "Authorization" not in request_headers
+
+    @pytest.mark.anyio
+    async def test_protected_image_uses_authenticated_attachment_download(self):
+        from gateway.platforms.base import MessageType
+
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"\x89PNG fake")
+        cache_image_bytes = MagicMock(return_value="/tmp/protected-image.png")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_teams_mod, "cache_image_from_bytes", cache_image_bytes, raising=False)
+            activity = self._make_activity([self._image_attachment()])
+            await adapter._on_message(self._make_ctx(activity))
+
+        adapter._fetch_attachment_bytes.assert_awaited_once_with(
+            "https://smba.example.com/img.png"
+        )
+        cache_image_bytes.assert_called_once_with(b"\x89PNG fake", ext=".png")
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.PHOTO
+        assert event.media_urls == ["/tmp/protected-image.png"]
+        assert event.media_types == ["image/png"]
+
+    @pytest.mark.anyio
     async def test_mixed_image_and_document_prefers_document(self):
         from gateway.platforms.base import MessageType
 
         adapter = self._make_adapter()
         adapter._fetch_attachment_bytes = AsyncMock(return_value=b"%PDF-1.4 fake")
 
-        async def fake_cache_image(url, *a, **kw):
+        def fake_cache_image(data, *a, **kw):
             return "/tmp/img.png"
 
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(_teams_mod, "cache_image_from_url", fake_cache_image)
+            mp.setattr(_teams_mod, "cache_image_from_bytes", fake_cache_image)
             activity = self._make_activity([
                 self._image_attachment(),
                 self._file_download_attachment(),
@@ -597,6 +678,50 @@ class TestTeamsAttachmentClassification:
         assert event.message_type == MessageType.DOCUMENT
         assert len(event.media_urls) == 2
 
+    @pytest.mark.anyio
+    async def test_html_body_attachment_stays_text(self):
+        from gateway.platforms.base import MessageType
+
+        adapter = self._make_adapter()
+        activity = self._make_activity([self._html_body_attachment()])
+        await adapter._on_message(self._make_ctx(activity))
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.TEXT
+        assert event.media_urls == []
+
+    @pytest.mark.anyio
+    async def test_image_only_still_photo(self):
+        from gateway.platforms.base import MessageType
+
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"\x89PNG fake")
+
+        def fake_cache_image(data, *a, **kw):
+            return "/tmp/img.png"
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_teams_mod, "cache_image_from_bytes", fake_cache_image)
+            activity = self._make_activity([self._image_attachment()])
+            await adapter._on_message(self._make_ctx(activity))
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.PHOTO
+        assert event.media_urls == ["/tmp/img.png"]
+
+    @pytest.mark.anyio
+    async def test_download_failure_degrades_to_text(self):
+        from gateway.platforms.base import MessageType
+
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(side_effect=Exception("boom"))
+
+        activity = self._make_activity([self._file_download_attachment()])
+        await adapter._on_message(self._make_ctx(activity))
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.TEXT
+        assert event.media_urls == []
 
 # ── _standalone_send (out-of-process cron delivery) ──────────────────────
 

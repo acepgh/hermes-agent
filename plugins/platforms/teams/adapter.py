@@ -31,7 +31,7 @@ import os
 import sys
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 # httpx is imported lazily — only the ``_write_summary_via_incoming_webhook``
 # code path actually constructs an ``AsyncClient``. Top-level import here
@@ -89,7 +89,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
-    cache_image_from_url,
+    cache_image_from_bytes,
     cache_media_bytes,
 )
 
@@ -871,18 +871,28 @@ class TeamsAdapter(BasePlatformAdapter):
         logger.info("[teams] Disconnected")
 
     async def _fetch_attachment_bytes(self, url: str, timeout: float = 30.0) -> bytes:
-        """Download attachment bytes with SSRF protection.
+        """Download attachment bytes with SSRF and token-exfiltration protection.
 
-        Teams file attachments carry pre-authenticated SharePoint download
-        URLs (no extra auth header needed). Validates the URL against the
-        SSRF guard and follows redirects through the shared redirect guard,
-        matching the cache_*_from_url helpers in gateway.platforms.base.
+        SharePoint file-download URLs are pre-authenticated and receive no bot
+        credential. Bot Framework attachment URLs are protected, so requests
+        to the explicit Bot Framework host allowlist receive the SDK-managed
+        bot bearer token. No other host may receive that token.
         """
         from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
         from gateway.platforms.base import _ssrf_redirect_guard
 
         if not is_safe_url(url):
             raise ValueError("Blocked unsafe attachment URL (SSRF protection)")
+
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"}
+        hostname = (urlparse(url).hostname or "").lower()
+        if hostname in _ALLOWED_TEAMS_SERVICE_HOSTS:
+            if self._app is None:
+                raise RuntimeError("Teams app cannot acquire a Bot Framework attachment token")
+            token = await self._app._get_bot_token()
+            if not token:
+                raise RuntimeError("Teams app returned no Bot Framework attachment token")
+            headers["Authorization"] = f"Bearer {token}"
 
         async with create_ssrf_safe_async_client(
             timeout=timeout,
@@ -891,7 +901,7 @@ class TeamsAdapter(BasePlatformAdapter):
         ) as client:
             response = await client.get(
                 url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"},
+                headers=headers,
             )
             response.raise_for_status()
             return response.content
@@ -996,7 +1006,14 @@ class TeamsAdapter(BasePlatformAdapter):
 
             if content_url and content_type.startswith("image/"):
                 try:
-                    cached = await cache_image_from_url(content_url)
+                    data = await self._fetch_attachment_bytes(content_url)
+                    image_ext = {
+                        "image/jpeg": ".jpg",
+                        "image/png": ".png",
+                        "image/gif": ".gif",
+                        "image/webp": ".webp",
+                    }.get(content_type, ".jpg")
+                    cached = cache_image_from_bytes(data, ext=image_ext)
                     if cached:
                         media_urls.append(cached)
                         media_types.append(content_type)
