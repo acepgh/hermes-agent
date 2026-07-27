@@ -619,6 +619,28 @@ class TestTeamsAttachmentClassification:
         assert request_headers["Authorization"] == "Bearer bot-token"
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://smba.trafficmanager.net/amer/tenant/v3/attachments/1/views/original",
+            "https://smba.trafficmanager.net:444/amer/tenant/v3/attachments/1/views/original",
+        ],
+    )
+    async def test_bot_framework_token_requires_https_default_port(
+        self,
+        monkeypatch,
+        url,
+    ):
+        adapter = self._make_adapter()
+        adapter._app._get_bot_token = AsyncMock(return_value="bot-token")
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+
+        with pytest.raises(ValueError, match="HTTPS on port 443 is required"):
+            await adapter._fetch_attachment_bytes(url)
+
+        adapter._app._get_bot_token.assert_not_awaited()
+
+    @pytest.mark.anyio
     async def test_non_bot_framework_download_never_receives_bot_token(self, monkeypatch):
         adapter = self._make_adapter()
         adapter._app._get_bot_token = AsyncMock(return_value="bot-token")

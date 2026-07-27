@@ -893,8 +893,17 @@ class TeamsAdapter(BasePlatformAdapter):
             raise ValueError("Blocked unsafe attachment URL (SSRF protection)")
 
         headers = {"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"}
-        hostname = (urlparse(url).hostname or "").lower()
+        parsed_url = urlparse(url)
+        hostname = (parsed_url.hostname or "").lower()
         if hostname in _ALLOWED_TEAMS_SERVICE_HOSTS:
+            try:
+                port = parsed_url.port
+            except ValueError as exc:
+                raise ValueError("Invalid Bot Framework attachment URL port") from exc
+            if parsed_url.scheme.lower() != "https" or port not in (None, 443):
+                raise ValueError(
+                    "Refusing insecure Bot Framework attachment URL; HTTPS on port 443 is required"
+                )
             if self._app is None:
                 raise RuntimeError("Teams app cannot acquire a Bot Framework attachment token")
             token = await self._app._get_bot_token()
