@@ -579,11 +579,23 @@ class TestTeamsAttachmentClassification:
     async def test_bot_framework_download_adds_sdk_bearer_token(self, monkeypatch):
         adapter = self._make_adapter()
         adapter._app._get_bot_token = AsyncMock(return_value="bot-token")
+        async def chunks():
+            yield b"protected image"
+
         response = SimpleNamespace(
-            content=b"protected image",
+            headers={},
+            aiter_bytes=chunks,
             raise_for_status=MagicMock(),
         )
-        client = SimpleNamespace(get=AsyncMock(return_value=response))
+
+        class ResponseContext:
+            async def __aenter__(self):
+                return response
+
+            async def __aexit__(self, *_args):
+                return False
+
+        client = SimpleNamespace(stream=MagicMock(return_value=ResponseContext()))
 
         class ClientContext:
             async def __aenter__(self):
@@ -603,15 +615,30 @@ class TestTeamsAttachmentClassification:
         )
 
         assert data == b"protected image"
-        request_headers = client.get.await_args.kwargs["headers"]
+        request_headers = client.stream.call_args.kwargs["headers"]
         assert request_headers["Authorization"] == "Bearer bot-token"
 
     @pytest.mark.anyio
     async def test_non_bot_framework_download_never_receives_bot_token(self, monkeypatch):
         adapter = self._make_adapter()
         adapter._app._get_bot_token = AsyncMock(return_value="bot-token")
-        response = SimpleNamespace(content=b"file", raise_for_status=MagicMock())
-        client = SimpleNamespace(get=AsyncMock(return_value=response))
+        async def chunks():
+            yield b"file"
+
+        response = SimpleNamespace(
+            headers={},
+            aiter_bytes=chunks,
+            raise_for_status=MagicMock(),
+        )
+
+        class ResponseContext:
+            async def __aenter__(self):
+                return response
+
+            async def __aexit__(self, *_args):
+                return False
+
+        client = SimpleNamespace(stream=MagicMock(return_value=ResponseContext()))
 
         class ClientContext:
             async def __aenter__(self):
@@ -631,8 +658,47 @@ class TestTeamsAttachmentClassification:
         )
 
         adapter._app._get_bot_token.assert_not_awaited()
-        request_headers = client.get.await_args.kwargs["headers"]
+        request_headers = client.stream.call_args.kwargs["headers"]
         assert "Authorization" not in request_headers
+
+    @pytest.mark.anyio
+    async def test_attachment_download_enforces_inbound_media_cap(self, monkeypatch):
+        adapter = self._make_adapter()
+        response = SimpleNamespace(
+            headers={"content-length": "5"},
+            raise_for_status=MagicMock(),
+        )
+
+        class ResponseContext:
+            async def __aenter__(self):
+                return response
+
+            async def __aexit__(self, *_args):
+                return False
+
+        client = SimpleNamespace(stream=MagicMock(return_value=ResponseContext()))
+
+        class ClientContext:
+            async def __aenter__(self):
+                return client
+
+            async def __aexit__(self, *_args):
+                return False
+
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client",
+            lambda **_kwargs: ClientContext(),
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base.get_inbound_media_max_bytes",
+            lambda: 4,
+        )
+
+        with pytest.raises(ValueError, match="Inbound attachment payload is too large"):
+            await adapter._fetch_attachment_bytes(
+                "https://contoso.sharepoint.com/download/oversized.png"
+            )
 
     @pytest.mark.anyio
     async def test_protected_image_uses_authenticated_attachment_download(self):

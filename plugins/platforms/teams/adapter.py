@@ -879,7 +879,10 @@ class TeamsAdapter(BasePlatformAdapter):
         bot bearer token. No other host may receive that token.
         """
         from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
-        from gateway.platforms.base import _ssrf_redirect_guard
+        from gateway.platforms.base import (
+            _read_httpx_body_with_limit,
+            _ssrf_redirect_guard,
+        )
 
         if not is_safe_url(url):
             raise ValueError("Blocked unsafe attachment URL (SSRF protection)")
@@ -899,12 +902,12 @@ class TeamsAdapter(BasePlatformAdapter):
             follow_redirects=True,
             event_hooks={"response": [_ssrf_redirect_guard]},
         ) as client:
-            response = await client.get(
-                url,
-                headers=headers,
-            )
-            response.raise_for_status()
-            return response.content
+            async with client.stream("GET", url, headers=headers) as response:
+                response.raise_for_status()
+                return await _read_httpx_body_with_limit(
+                    response,
+                    media_type="attachment",
+                )
 
     async def _on_message(self, ctx: ActivityContext[MessageActivity]) -> None:
         """Process an incoming Teams message and dispatch to the gateway."""
