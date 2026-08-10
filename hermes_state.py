@@ -27,6 +27,7 @@ import sqlite3
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -2217,11 +2218,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # read-only connections so they never queue behind writer flushes on
         # self._lock. See _read_ctx().
         self._read_local = threading.local()
-        # Strong set of all live read connections across all threads.  We
-        # hold a reference so short-lived reader threads' connections are
-        # not GC'd without close() — that would leak tracked fds in
-        # _live_connections.  close() drains this set.
-        self._read_conns: "set[sqlite3.Connection]" = set()
+        # Live read connections across all threads, mapped to a weak
+        # reference to the thread that opened each one.
+        #
+        # This was a strong *set*, held so short-lived reader threads'
+        # connections were not GC'd without close(): a GC'd-but-unclosed
+        # connection never decrements sqlite_safe_read._live_connections,
+        # leaving the byte-probe guard armed forever.  But nothing removed
+        # entries except close(), so in a process that never closes its
+        # SessionDB (a gateway runs for weeks) every reader thread that ever
+        # ran pinned one connection — ~2 fds each — until the process hit
+        # EMFILE and stopped serving.
+        #
+        # The strong set did not even achieve the untrack it existed for:
+        # connections default to check_same_thread=True, so close()'s
+        # cross-thread conn.close() raises ProgrammingError, which its
+        # `except Exception: pass` swallowed.
+        #
+        # Keying by thread lets _reap_dead_read_conns() release connections
+        # whose owning thread has exited — the point at which a per-thread
+        # connection becomes provably unreachable.
+        self._read_conns: "Dict[sqlite3.Connection, Callable[[], Optional[threading.Thread]]]" = {}
         self._read_conns_lock = threading.Lock()
         # Set when close() begins.  _get_read_conn checks this under the
         # lock so a reader that finishes opening after the drain finds the
@@ -2456,6 +2473,63 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # ── Read-path split ──
 
+    def _release_read_conn(self, conn: sqlite3.Connection) -> None:
+        """Close *conn* and release its byte-probe-guard registration.
+
+        Two things must happen for a read connection to be fully reclaimed:
+        the fd must be released, and ``sqlite_safe_read._live_connections``
+        must be decremented so the byte-probe guard for this database is not
+        left armed forever.
+
+        ``conn.close()`` does both — but only from the thread that opened the
+        connection (``check_same_thread`` defaults to True).  When the owning
+        thread has exited we cannot call it, so we untrack explicitly and drop
+        our last reference: CPython's connection dealloc closes the underlying
+        sqlite handle, which is what actually frees the fd.  (Dealloc does not
+        route through the Python-level ``close()`` override, so the manual
+        untrack is required and cannot double-decrement.)
+        """
+        try:
+            conn.close()
+            return
+        except sqlite3.ProgrammingError:
+            pass  # opened on a thread that has since exited
+        except Exception:
+            return
+        try:
+            from hermes_cli.sqlite_safe_read import untrack_connection
+
+            untrack_connection(self.db_path)
+        except Exception:
+            # Scaffold/embed installs ship hermes_state without hermes_cli;
+            # nothing was tracked there, so nothing needs untracking.
+            pass
+
+    def _reap_dead_read_conns(self) -> None:
+        """Release read connections whose owning thread has exited.
+
+        A per-thread connection is unreachable once its thread is gone —
+        ``threading.local`` has dropped its reference and no new query can
+        reuse it — so this is the safe point to reclaim it.  Without this,
+        every reader thread that ever ran leaks ~2 fds for the life of the
+        process.
+
+        Runs on the open path, so the registry stays proportional to live
+        reader threads rather than to threads-ever-created.
+        """
+        dead: "List[sqlite3.Connection]" = []
+        with self._read_conns_lock:
+            if self._read_conns_closed:
+                return
+            for conn, thread_ref in list(self._read_conns.items()):
+                thread = thread_ref()
+                if thread is None or not thread.is_alive():
+                    del self._read_conns[conn]
+                    dead.append(conn)
+        # Close outside the lock: close() can block on the sqlite mutex.
+        for conn in dead:
+            self._release_read_conn(conn)
+
     def _get_read_conn(self) -> Optional[sqlite3.Connection]:
         """Per-thread read-only connection, or None when unavailable.
 
@@ -2476,6 +2550,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return conn
         if getattr(self._read_local, "failed", False):
             return None
+        # Reclaim connections stranded by threads that have since exited,
+        # before adding one more.  Bounds the registry to live readers.
+        self._reap_dead_read_conns()
         try:
             conn = _connect_tracked_db(
                 f"file:{self.db_path}?mode=ro",
@@ -2483,6 +2560,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 uri=True,
                 timeout=5.0,
                 isolation_level=None,
+                # Not to share the connection — it stays private to the thread
+                # that opened it, cached in self._read_local.  It is so the
+                # reaper (and close()) can call conn.close() after that thread
+                # has exited.  close() is the only thing that releases the fd
+                # and decrements the byte-probe tracker; with the default
+                # check_same_thread=True it raises ProgrammingError from any
+                # other thread, so a dead thread's connection could never be
+                # reclaimed and leaked ~2 fds for the life of the process.
+                # The writer connection already opts out for the same reason.
+                check_same_thread=False,
             )
             conn.row_factory = sqlite3.Row
             apply_database_pragmas(conn, db_label="state.db")
@@ -2499,7 +2586,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     conn.close()
                     self._read_local.failed = True
                     return None
-                self._read_conns.add(conn)
+                # Weak ref: the registry must not keep a dead thread alive,
+                # and _reap_dead_read_conns treats a collected referent the
+                # same as an exited thread.
+                self._read_conns[conn] = weakref.ref(threading.current_thread())
         except sqlite3.Error:
             # Mark this thread failed so we don't retry the open on every
             # query; the locked writer connection still serves reads.
@@ -3033,22 +3123,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # (instance, function), so this removes exactly our registration;
         # no-op when the writer never started.
         atexit.unregister(self._drain_token_queue_at_exit)
-        # Close all read-only connections across all threads.  Per-thread
-        # connections live in threading.local() and would otherwise be GC'd
-        # without calling close(), leaking tracked fds in _live_connections.
-        # The strong set holds references so short-lived reader threads'
-        # connections survive until close() drains them.  Setting the closed
-        # flag under the lock prevents a reader from registering a new
-        # connection after the drain.
+        # Release every read-only connection across all threads.  Setting the
+        # closed flag under the lock prevents a reader from registering a new
+        # connection after the drain.  _release_read_conn handles the ones
+        # whose owning thread has already exited — a plain conn.close() here
+        # raises ProgrammingError for those (check_same_thread), which the old
+        # bare `except Exception: pass` swallowed, silently skipping both the
+        # fd release and the _live_connections untrack.
         with self._read_conns_lock:
             self._read_conns_closed = True
             read_conns = list(self._read_conns)
             self._read_conns.clear()
         for conn in read_conns:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            self._release_read_conn(conn)
         self._read_local.conn = None
         with self._lock:
             if self._conn:
