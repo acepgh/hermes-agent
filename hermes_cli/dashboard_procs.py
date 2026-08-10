@@ -12,7 +12,10 @@ one-way at import time (main.py imports this module, never the reverse).
 patches on ``hermes_cli.main`` resolve unchanged.
 """
 
+import functools
+import ntpath
 import os
+import posixpath
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +26,139 @@ def _m():
     from hermes_cli import main
 
     return main
+
+
+# Long-lived server subcommands that ``hermes update`` must reap so the running
+# Python backend can't outlive the JS bundle it was built against.
+_REAPABLE_SUBCOMMANDS = frozenset({"dashboard", "serve"})
+
+# Tokens that identify the hermes entrypoint itself, in the three forms it is
+# ever spawned as: the console script (``…/bin/hermes``), ``python -m
+# hermes_cli.main``, and a direct script path (``…/hermes_cli/main.py``).
+_ENTRYPOINT_BASENAMES = frozenset({"hermes", "hermes.exe"})
+_ENTRYPOINT_MODULES = frozenset({"hermes_cli.main"})
+_ENTRYPOINT_SCRIPT_SUFFIXES = ("hermes_cli/main.py", "hermes_cli\\main.py")
+
+# Used only if parser introspection fails (partially-installed tree mid-update).
+# Covers the flags a spawned backend actually carries, `--profile` above all.
+_FALLBACK_VALUE_FLAGS = frozenset(
+    {
+        "--profile", "-p", "-m", "--model", "--provider", "--reasoning",
+        "-t", "--toolsets", "-r", "--resume", "-c", "--continue",
+        "-s", "--skills", "-z", "--oneshot", "--usage-file",
+    }
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _global_value_flags() -> frozenset:
+    """Top-level flags that consume the token after them.
+
+    Derived by introspecting the real parser — the same sanctioned idiom
+    ``hermes_cli.relaunch._build_inherited_flag_table`` uses — so this can't
+    drift out of sync with the CLI the way a hand-maintained list would.
+    ``--profile``/``-p`` never reach argparse (``main._apply_profile_override``
+    strips them pre-parse), so they come from ``PRE_ARGPARSE_INHERITED_FLAGS``.
+    """
+    flags: set = set()
+    try:
+        from hermes_cli._parser import (
+            PRE_ARGPARSE_INHERITED_FLAGS,
+            build_top_level_parser,
+        )
+
+        parser, _subparsers, _chat = build_top_level_parser()
+        for action in parser._actions:
+            if action.option_strings and action.nargs != 0:
+                flags.update(action.option_strings)  # store_true sets nargs=0
+        flags.update(opt for opt, takes_value in PRE_ARGPARSE_INHERITED_FLAGS if takes_value)
+    except Exception:
+        return _FALLBACK_VALUE_FLAGS
+    return frozenset(flags) or _FALLBACK_VALUE_FLAGS
+
+
+def _basenames(token: str) -> tuple[str, str]:
+    """Both separator interpretations — a Windows cmdline can be scanned
+    from any host (wmic output is parsed on Windows, but tests and shared
+    fixtures exercise these strings everywhere)."""
+    return posixpath.basename(token), ntpath.basename(token)
+
+
+def _is_entrypoint_token(token: str) -> bool:
+    """Whether *token* names the hermes entrypoint (any spawn form)."""
+    if token in _ENTRYPOINT_MODULES:
+        return True
+    if token.endswith(_ENTRYPOINT_SCRIPT_SUFFIXES):
+        return True
+    return any(base in _ENTRYPOINT_BASENAMES for base in _basenames(token))
+
+
+def _is_launcher_token(token: str) -> bool:
+    """Whether *token* may legitimately precede the entrypoint in argv.
+
+    Only an interpreter and its flags qualify (``python3 -m hermes_cli.main``,
+    ``/usr/bin/env python -m …``).  Without this, any command that merely
+    *mentions* hermes — ``grep hermes serve``, ``sudo -u x hermes serve`` in a
+    doc example, a shell wrapper — would present ``hermes`` as an entrypoint
+    with ``serve`` behind it and get killed.
+    """
+    if token.startswith("-"):
+        return True  # interpreter flag, e.g. `-m`, `-E`, `-S`
+    return any(
+        base == "env" or base.startswith("python") for base in _basenames(token)
+    )
+
+
+def _hermes_subcommand(command: str) -> str | None:
+    """Return the hermes subcommand in *command*, or None if it isn't hermes.
+
+    Resolves the subcommand as an **argv token** rather than a substring
+    adjacent to the entrypoint. Profile-scoped backends put global options
+    between the two — ``python -m hermes_cli.main --profile alfie serve`` —
+    so the old ``"hermes_cli.main serve" in command`` test silently missed
+    every one of them, and ``hermes update`` respawned backends without ever
+    reaping the ones it replaced.
+
+    Skipping option *values* (not just options) is what keeps this from
+    matching chat traffic: ``ps`` joins argv with spaces and does no quoting,
+    so ``hermes chat -q restart the dashboard`` arrives as bare words. Walking
+    to the first genuine positional yields ``chat`` there and stops.
+    """
+    tokens = command.split()
+    entry = next(
+        (
+            i
+            for i, tok in enumerate(tokens)
+            if _is_entrypoint_token(tok)
+            # argv[0], or preceded only by an interpreter and its flags.
+            and all(_is_launcher_token(prev) for prev in tokens[:i])
+        ),
+        None,
+    )
+    if entry is None:
+        return None
+
+    value_flags = _global_value_flags()
+    i = entry + 1
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "--":  # explicit end of options; next token is positional
+            i += 1
+            continue
+        if token.startswith("-") and token != "-":
+            # `--flag=value` carries its value inline — never eat the next token.
+            if not token.startswith("--") or "=" not in token:
+                if token in value_flags:
+                    i += 1
+            i += 1
+            continue
+        return token  # first real positional = the subcommand
+    return None
+
+
+def _matches_reapable_backend(command: str) -> bool:
+    """Whether *command* is a long-lived hermes backend worth reaping."""
+    return _hermes_subcommand(command) in _REAPABLE_SUBCOMMANDS
 
 
 def _scan_dashboard_processes(
@@ -42,6 +178,13 @@ def _scan_dashboard_processes(
     through their owning systemd scope; only manually-started processes use
     the kill path because we can't know their original launch args.
 
+    Matching goes through ``_hermes_subcommand``, which resolves the
+    subcommand as an argv token.  This module previously substring-matched
+    ``"hermes_cli.main serve"``, which no profile-scoped backend ever contains
+    (``--profile <name>`` sits between the two), so those processes were
+    invisible here and ``hermes update`` accumulated one orphaned backend —
+    plus its whole MCP subprocess tree — per update.
+
     *exclude_pids* is an optional set of PIDs that must never be returned.
     This is used by the Hermes Desktop Electron app to protect its own
     backend child process: when the desktop spawns ``hermes serve`` as
@@ -53,17 +196,11 @@ def _scan_dashboard_processes(
 
     Returns an empty list on any scan error (missing ps/wmic, timeout, etc.).
     """
-    patterns = [
-        "hermes dashboard",
-        "hermes_cli.main dashboard",
-        "hermes_cli/main.py dashboard",
-        # The headless backend (`hermes serve`) is the same long-lived server
-        # under a different command name — the desktop app spawns it. Reap it
-        # on update for the same frontend/backend-mismatch reason.
-        "hermes serve",
-        "hermes_cli.main serve",
-        "hermes_cli/main.py serve",
-    ]
+    # Matching is by argv token (``_hermes_subcommand``), not by substring.
+    # The headless backend (`hermes serve`) is the same long-lived server under
+    # a different command name — the desktop app spawns it, and profile-scoped
+    # gateways spawn it as `--profile <name> serve`. Reap both for the same
+    # frontend/backend-mismatch reason.
     self_pid = os.getpid()
     dashboard_processes: list[tuple[int, str]] = []
 
@@ -100,7 +237,7 @@ def _scan_dashboard_processes(
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId=") :]
                     if (
-                        any(p in current_cmd for p in patterns)
+                        _matches_reapable_backend(current_cmd)
                         and int(pid_str) != self_pid
                     ):
                         try:
@@ -108,12 +245,12 @@ def _scan_dashboard_processes(
                         except ValueError:
                             pass
         else:
-            # Linux / macOS: scan the process table via ps and match against
-            # the same explicit patterns list used on Windows.  Using ps
-            # (rather than `pgrep -f "hermes.*dashboard"`) keeps us consistent
-            # with `hermes_cli.gateway._scan_gateway_pids` and avoids the
-            # greedy regex matching unrelated cmdlines that merely contain
-            # both words (e.g. a chat session discussing "dashboard").
+            # Linux / macOS: scan the process table via ps and apply the same
+            # token matcher used on Windows.  Using ps (rather than
+            # `pgrep -f "hermes.*dashboard"`) keeps us consistent with
+            # `hermes_cli.gateway._scan_gateway_pids` and avoids the greedy
+            # regex matching unrelated cmdlines that merely contain both words
+            # (e.g. a chat session discussing "dashboard").
             result = subprocess.run(
                 ["ps", "-A", "-o", "pid=,command="],
                 capture_output=True,
@@ -133,7 +270,7 @@ def _scan_dashboard_processes(
                     except ValueError:
                         continue
                     command = parts[1]
-                    if any(p in command for p in patterns) and pid != self_pid:
+                    if _matches_reapable_backend(command) and pid != self_pid:
                         dashboard_processes.append((pid, command))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
